@@ -1,0 +1,7 @@
+
+# ReconX core uses Python standard-library modules.
+# No third-party Python packages are currently required.
+#
+# Nmap is a separate system dependency.
+# Termux: pkg install nmap
+# Ubuntu/Debian: sudo apt install nmap
