@@ -2,8 +2,11 @@
 #!/usr/bin/env python3
 """
 ReconX - Portable Reconnaissance Toolkit
+Version 0.2
+
 For authorised security assessments only.
-Compatible with Linux and Termux.
+Compatible with Linux and Android Termux.
+Requires Python 3.10+.
 """
 
 import argparse
@@ -19,13 +22,20 @@ import sys
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+
 from pathlib import Path
+from urllib.parse import urlsplit
 
 APP = "ReconX"
-VERSION = "0.1"
-USER_AGENT = "ReconX/0.1"
+VERSION = "0.2"
+USER_AGENT = "ReconX/0.2"
 DEFAULT_TIMEOUT = 8
+MAX_PORT_SELECTION = 100
 
+
+# ==========================================
+# GENERAL UTILITIES
+# ==========================================
 
 def timestamp():
     return datetime.datetime.now(
@@ -33,69 +43,208 @@ def timestamp():
     ).isoformat()
 
 
+def validate_timeout(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("Timeout must be an integer.")
+
+    if not 1 <= value <= 300:
+        raise ValueError("Timeout must be between 1 and 300 seconds.")
+
+    return value
+
+
+def validate_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "Port must be a number."
+        )
+
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            "Port must be between 1 and 65535."
+        )
+
+    return port
+
+
 def validate_host(value):
     value = value.strip()
 
-    if not value or any(c in value for c in "/?#@ "):
-        raise ValueError("Enter a hostname or IP, not a URL.")
+    if not value or any(
+        char in value for char in "/?#@ \t\r\n"
+    ):
+        raise ValueError(
+            "Enter a hostname or IP address, not a URL."
+        )
 
     try:
         return str(ipaddress.ip_address(value))
     except ValueError:
-        host = value.rstrip(".").encode("idna").decode("ascii").lower()
+        pass
 
-        if len(host) > 253 or "." not in host:
+    try:
+        host = (
+            value.rstrip(".")
+            .encode("idna")
+            .decode("ascii")
+            .lower()
+        )
+    except UnicodeError:
+        raise ValueError("Invalid hostname.")
+
+    if not host or len(host) > 253 or "." not in host:
+        raise ValueError("Invalid hostname.")
+
+    for label in host.split("."):
+        if (
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not all(
+                char.isalnum() or char == "-"
+                for char in label
+            )
+        ):
             raise ValueError("Invalid hostname.")
 
-        for label in host.split("."):
-            if (
-                not label
-                or len(label) > 63
-                or label.startswith("-")
-                or label.endswith("-")
-                or not all(c.isalnum() or c == "-" for c in label)
+    return host
+
+
+def validate_ports(value):
+    """
+    Accept numeric TCP ports and ranges.
+    Maximum selection: 100 unique ports.
+    """
+
+    selected = set()
+
+    for part in value.split(","):
+        part = part.strip()
+
+        if not part:
+            raise ValueError("Invalid port selection.")
+
+        if "-" in part:
+            pieces = part.split("-")
+
+            if len(pieces) != 2:
+                raise ValueError("Invalid port range.")
+
+            try:
+                start, end = map(int, pieces)
+            except ValueError:
+                raise ValueError("Ports must be numeric.")
+
+            if not (
+                1 <= start <= 65535
+                and 1 <= end <= 65535
+                and start <= end
             ):
-                raise ValueError("Invalid hostname.")
+                raise ValueError("Invalid port range.")
 
-        return host
+            selected.update(range(start, end + 1))
 
+        else:
+            try:
+                port = int(part)
+            except ValueError:
+                raise ValueError("Ports must be numeric.")
+
+            if not 1 <= port <= 65535:
+                raise ValueError(
+                    "Ports must be between 1 and 65535."
+                )
+
+            selected.add(port)
+
+        if len(selected) > MAX_PORT_SELECTION:
+            raise ValueError(
+                "Maximum selection is 100 unique ports."
+            )
+
+    if not selected:
+        raise ValueError("No ports selected.")
+
+    return ",".join(
+        str(port) for port in sorted(selected)
+    )
+
+
+# ==========================================
+# AUTHORISATION
+# ==========================================
 
 def authorization(scope):
     print("\n================================")
     print("       RECONX AUTHORIZATION")
     print("================================")
     print("Target:", scope)
+    print()
     print("Only assess systems you own or")
-    print("have explicit permission to test.\n")
+    print("have explicit permission to test.")
+    print()
 
-    answer = input("Are you authorized? [y/N]: ")
+    answer = input(
+        "Are you authorized? [y/N]: "
+    ).strip().lower()
 
-    if answer.lower() not in ("y", "yes"):
+    if answer not in ("y", "yes"):
         sys.exit("Scan cancelled.")
 
 
+# ==========================================
+# DNS
+# ==========================================
+
 def resolve_dns(host):
     try:
-        return sorted({
+        addresses = {
             item[4][0]
-            for item in socket.getaddrinfo(host, None)
-        })
-    except socket.gaierror as error:
-        return [str(error)]
+            for item in socket.getaddrinfo(
+                host,
+                None,
+                type=socket.SOCK_STREAM
+            )
+        }
 
+        return sorted(addresses)
+
+    except socket.gaierror as error:
+        return []
+
+
+# ==========================================
+# REPORT GENERATION
+# ==========================================
 
 def save_report(data, output=None, fmt="json"):
-    Path("reports").mkdir(exist_ok=True)
 
     if output:
         path = Path(output)
     else:
+        Path("reports").mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
         stamp = datetime.datetime.now().strftime(
             "%Y%m%d-%H%M%S"
         )
-        path = Path("reports") / f"reconx-{stamp}.{fmt}"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+        path = (
+            Path("reports")
+            / f"reconx-{stamp}.{fmt}"
+        )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     if fmt == "json":
         path.write_text(
@@ -107,56 +256,86 @@ def save_report(data, output=None, fmt="json"):
         rows = ""
 
         for key, value in data.items():
+            formatted = json.dumps(
+                value,
+                indent=2,
+                ensure_ascii=False
+            )
+
             rows += (
                 "<tr><th>"
                 + html.escape(str(key))
                 + "</th><td><pre>"
-                + html.escape(json.dumps(value, indent=2))
+                + html.escape(formatted)
                 + "</pre></td></tr>"
             )
 
-        document = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="UTF-8">
-        <title>ReconX Report</title>
-        <style>
-        body {{
-            font-family: Arial;
-            margin: 30px;
-            background: #111827;
-            color: white;
-        }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        td, th {{
-            border: 1px solid #555;
-            padding: 12px;
-            text-align: left;
-        }}
-        pre {{ white-space: pre-wrap; }}
-        </style>
-        </head>
-        <body>
-        <h1>ReconX Security Report</h1>
-        <table>{rows}</table>
-        </body>
-        </html>
-        """
+        document = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReconX Report</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    margin: 25px;
+    background: #111827;
+    color: white;
+}}
+h1 {{ color: #38bdf8; }}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+}}
+td, th {{
+    border: 1px solid #475569;
+    padding: 12px;
+    text-align: left;
+    vertical-align: top;
+}}
+th {{ width: 180px; }}
+pre {{
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}}
+</style>
+</head>
+<body>
+<h1>ReconX Security Report</h1>
+<p>Version {VERSION}</p>
+<table>{rows}</table>
+</body>
+</html>
+"""
 
-        path.write_text(document, encoding="utf-8")
+        path.write_text(
+            document,
+            encoding="utf-8"
+        )
 
     return path
 
 
+# ==========================================
+# WEB RECONNAISSANCE
+# ==========================================
+
 def web_scan(args):
+
     host = validate_host(args.target)
 
     port = args.port or (
         443 if args.scheme == "https" else 80
     )
 
-    url = f"{args.scheme}://{host}:{port}/"
+    url_host = (
+        f"[{host}]" if ":" in host else host
+    )
+
+    url = (
+        f"{args.scheme}://{url_host}:{port}/"
+    )
 
     result = {
         "tool": APP,
@@ -170,15 +349,14 @@ def web_scan(args):
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": USER_AGENT},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*"
+        },
         method="GET"
     )
 
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(
-            context=ssl.create_default_context()
-        )
-    )
+    opener = urllib.request.build_opener()
 
     try:
         with opener.open(
@@ -189,19 +367,32 @@ def web_scan(args):
             result["http"] = {
                 "status": response.status,
                 "final_url": response.geturl(),
-                "headers": dict(response.headers.items())
+                "headers": dict(
+                    response.headers.items()
+                )
             }
 
     except urllib.error.HTTPError as error:
         result["http"] = {
             "status": error.code,
-            "headers": dict(error.headers.items())
+            "final_url": error.geturl(),
+            "headers": dict(
+                error.headers.items()
+            )
         }
 
-    except Exception as error:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ValueError
+    ) as error:
         result["http_error"] = str(error)
 
+    # HTTPS certificate and connection information
+
     if args.scheme == "https":
+
         try:
             context = ssl.create_default_context()
 
@@ -226,21 +417,82 @@ def web_scan(args):
                         "valid_until": cert.get("notAfter")
                     }
 
-        except Exception as error:
+        except (
+            ssl.SSLError,
+            OSError,
+            TimeoutError,
+            ValueError
+        ) as error:
             result["tls_error"] = str(error)
 
     return result
 
 
-def port_scan(args):
-    host = validate_host(args.target)
+# ==========================================
+# NMAP UTILITIES
+# ==========================================
+
+def get_nmap():
 
     nmap = shutil.which("nmap")
 
     if not nmap:
         raise RuntimeError(
-            "Nmap missing. Install it using your package manager."
+            "Nmap is missing. Install it first."
         )
+
+    return nmap
+
+
+def run_nmap(command, timeout):
+
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "Nmap exceeded its allowed execution time."
+        )
+
+    if process.returncode != 0:
+        message = (
+            process.stderr.strip()
+            or process.stdout.strip()
+            or "Unknown Nmap error."
+        )
+
+        raise RuntimeError(
+            f"Nmap failed: {message}"
+        )
+
+    if not process.stdout.strip():
+        raise RuntimeError(
+            "Nmap returned an empty report."
+        )
+
+    try:
+        return ET.fromstring(process.stdout)
+
+    except ET.ParseError:
+        raise RuntimeError(
+            "Could not read Nmap XML output."
+        )
+
+
+# ==========================================
+# TCP PORT DISCOVERY
+# ==========================================
+
+def port_scan(args):
+
+    host = validate_host(args.target)
+    nmap = get_nmap()
 
     command = [
         nmap,
@@ -253,30 +505,34 @@ def port_scan(args):
         "--host-timeout",
         f"{args.timeout}s",
         "-oX",
-        "-",
-        host
+        "-"
     ]
 
     if args.ports:
-        command[1:1] = ["-p", args.ports]
+        command.extend([
+            "-p",
+            validate_ports(args.ports)
+        ])
     else:
-        command[1:1] = ["--top-ports", "100"]
+        command.extend([
+            "--top-ports",
+            "100"
+        ])
 
-    process = subprocess.run(
+    command.extend([
+        "--",
+        host
+    ])
+
+    root = run_nmap(
         command,
-        capture_output=True,
-        text=True,
-        timeout=args.timeout + 20
+        args.timeout + 30
     )
-
-    if process.returncode not in (0, 1):
-        raise RuntimeError(process.stderr)
-
-    root = ET.fromstring(process.stdout)
 
     ports = []
 
     for item in root.findall(".//port"):
+
         state = item.find("state")
         service = item.find("service")
 
@@ -285,19 +541,23 @@ def port_scan(args):
             "port": item.get("portid"),
             "state": (
                 state.get("state")
-                if state is not None else "unknown"
+                if state is not None
+                else "unknown"
             ),
             "service": (
                 service.get("name")
-                if service is not None else None
+                if service is not None
+                else None
             ),
             "product": (
                 service.get("product")
-                if service is not None else None
+                if service is not None
+                else None
             ),
             "version": (
                 service.get("version")
-                if service is not None else None
+                if service is not None
+                else None
             )
         })
 
@@ -307,19 +567,52 @@ def port_scan(args):
         "timestamp": timestamp(),
         "module": "ports",
         "target": host,
-        "ports": ports
+        "ports_scanned": (
+            validate_ports(args.ports)
+            if args.ports
+            else "Top 100 ports"
+        ),
+        "ports": ports,
+        "count": len(ports)
     }
 
 
-def local_scan(args):
-    network = ipaddress.ip_network(
-        args.network,
-        strict=False
-    )
+# ==========================================
+# LOCAL NETWORK DISCOVERY
+# ==========================================
 
-    if not network.is_private:
+def local_scan(args):
+
+    try:
+        network = ipaddress.ip_network(
+            args.network,
+            strict=False
+        )
+    except ValueError:
         raise ValueError(
-            "Only private network ranges are supported."
+            "Enter a valid IPv4 network CIDR."
+        )
+
+    if not isinstance(
+        network,
+        ipaddress.IPv4Network
+    ):
+        raise ValueError(
+            "Only IPv4 local networks are supported."
+        )
+
+    private_ranges = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16")
+    ]
+
+    if not any(
+        network.subnet_of(private)
+        for private in private_ranges
+    ):
+        raise ValueError(
+            "Only RFC1918 private IPv4 networks are supported."
         )
 
     if network.num_addresses > 256:
@@ -327,10 +620,7 @@ def local_scan(args):
             "Maximum supported network size is /24."
         )
 
-    nmap = shutil.which("nmap")
-
-    if not nmap:
-        raise RuntimeError("Nmap is required.")
+    nmap = get_nmap()
 
     command = [
         nmap,
@@ -340,26 +630,25 @@ def local_scan(args):
         "1",
         "-oX",
         "-",
+        "--",
         str(network)
     ]
 
-    process = subprocess.run(
+    root = run_nmap(
         command,
-        capture_output=True,
-        text=True,
-        timeout=args.timeout + 20
+        args.timeout + 30
     )
 
-    if process.returncode not in (0, 1):
-        raise RuntimeError(process.stderr)
-
-    root = ET.fromstring(process.stdout)
     hosts = []
 
     for host in root.findall("host"):
+
         status = host.find("status")
 
-        if status is None or status.get("state") != "up":
+        if (
+            status is None
+            or status.get("state") != "up"
+        ):
             continue
 
         addresses = [
@@ -370,7 +659,18 @@ def local_scan(args):
             for address in host.findall("address")
         ]
 
-        hosts.append({"addresses": addresses})
+        hostnames = [
+            item.get("name")
+            for item in host.findall(
+                "hostnames/hostname"
+            )
+            if item.get("name")
+        ]
+
+        hosts.append({
+            "addresses": addresses,
+            "hostnames": hostnames
+        })
 
     return {
         "tool": APP,
@@ -383,10 +683,17 @@ def local_scan(args):
     }
 
 
+# ==========================================
+# COMMAND-LINE INTERFACE
+# ==========================================
+
 def create_parser():
+
     parser = argparse.ArgumentParser(
         prog="reconx",
-        description="ReconX - Portable Reconnaissance Toolkit"
+        description=(
+            "ReconX - Portable Reconnaissance Toolkit"
+        )
     )
 
     parser.add_argument(
@@ -400,26 +707,46 @@ def create_parser():
         required=True
     )
 
+    # WEB MODULE
+
     web = modules.add_parser(
         "web",
         help="HTTP, HTTPS, DNS and TLS inspection"
     )
 
     web.add_argument("target")
+
     web.add_argument(
         "--scheme",
         choices=["http", "https"],
         default="https"
     )
-    web.add_argument("--port", type=int)
-    web.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+
+    web.add_argument(
+        "--port",
+        type=validate_port
+    )
+
+    web.add_argument(
+        "--timeout",
+        type=validate_timeout,
+        default=DEFAULT_TIMEOUT
+    )
+
     web.add_argument(
         "--format",
         choices=["json", "html"],
         default="json"
     )
-    web.add_argument("-o", "--output")
+
+    web.add_argument(
+        "-o",
+        "--output"
+    )
+
     web.set_defaults(function=web_scan)
+
+    # PORT MODULE
 
     ports = modules.add_parser(
         "ports",
@@ -427,40 +754,70 @@ def create_parser():
     )
 
     ports.add_argument("target")
-    ports.add_argument("--ports")
-    ports.add_argument("--timeout", type=int, default=60)
+
+    ports.add_argument(
+        "--ports",
+        help="Select up to 100 TCP ports, e.g. 22,80,443"
+    )
+
+    ports.add_argument(
+        "--timeout",
+        type=validate_timeout,
+        default=60
+    )
+
     ports.add_argument(
         "--format",
         choices=["json", "html"],
         default="json"
     )
-    ports.add_argument("-o", "--output")
+
+    ports.add_argument(
+        "-o",
+        "--output"
+    )
+
     ports.set_defaults(function=port_scan)
+
+    # LOCAL MODULE
 
     local = modules.add_parser(
         "local",
-        help="Private local-network discovery"
+        help="Private local IPv4 network discovery"
     )
 
     local.add_argument("network")
-    local.add_argument("--timeout", type=int, default=60)
+
+    local.add_argument(
+        "--timeout",
+        type=validate_timeout,
+        default=60
+    )
+
     local.add_argument(
         "--format",
         choices=["json", "html"],
         default="json"
     )
-    local.add_argument("-o", "--output")
+
+    local.add_argument(
+        "-o",
+        "--output"
+    )
+
     local.set_defaults(function=local_scan)
 
     return parser
 
 
+# ==========================================
+# MAIN PROGRAM
+# ==========================================
+
 def main():
+
     parser = create_parser()
     args = parser.parse_args()
-
-    if args.timeout < 1:
-        parser.error("Timeout must be at least 1 second.")
 
     scope = getattr(
         args,
@@ -469,6 +826,7 @@ def main():
     )
 
     try:
+
         authorization(scope)
 
         data = args.function(args)
@@ -479,30 +837,68 @@ def main():
             args.format
         )
 
-        print("\nReconX completed.")
+        print("\n================================")
+        print("       RECONX COMPLETED")
+        print("================================")
+
+        print("Version:", VERSION)
+        print("Module:", args.module)
         print("Report saved:", report)
 
         if args.module == "ports":
+
+            print("\nDiscovered TCP ports:")
+
             for port in data["ports"]:
+
                 print(
-                    f'{port["port"]}/{port["protocol"]} '
+                    f'{port["port"]}/'
+                    f'{port["protocol"]} '
                     f'{port["state"]} '
                     f'{port["service"] or ""}'
                 )
 
-        if args.module == "local":
-            print("Live devices:", data["count"])
+            print(
+                "\nTotal port entries:",
+                data["count"]
+            )
+
+        elif args.module == "local":
+
+            print(
+                "\nLive devices:",
+                data["count"]
+            )
+
+        elif args.module == "web":
+
+            print(
+                "\nHTTP status:",
+                data.get("http", {}).get(
+                    "status",
+                    "Unavailable"
+                )
+            )
+
+            print(
+                "DNS addresses:",
+                data["dns"]
+            )
 
     except KeyboardInterrupt:
+
         print("\nScan interrupted.")
         sys.exit(130)
 
     except (
         ValueError,
         RuntimeError,
-        subprocess.TimeoutExpired
+        OSError
     ) as error:
-        sys.exit(f"ReconX error: {error}")
+
+        sys.exit(
+            f"ReconX error: {error}"
+        )
 
 
 if __name__ == "__main__":
